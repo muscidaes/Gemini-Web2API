@@ -695,17 +695,20 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 		return
 	}
 
+	// ========== 【优化版】带 Referer + UA 的图片下载 ==========
 	var content strings.Builder
 	for i, imgURL := range imageURLs {
 		fullURL := imgURL
 		if !strings.Contains(fullURL, "=s") {
-			fullURL = imgURL + "=s2048"
+			fullURL = imgURL + "=s2048" // 保持你原来的缩放逻辑
 		}
-		data, err := client.FetchImage(fullURL)
+
+		data, err := fetchImageWithHeaders(fullURL)
 		if err != nil {
-			log.Printf("[Images] Failed to fetch image: %v", err)
+			log.Printf("[Images] Failed to fetch image: %v (URL: %s)", err, fullURL)
 			continue
 		}
+
 		b64 := base64.StdEncoding.EncodeToString(data)
 		content.WriteString(fmt.Sprintf("![Generated Image %d](data:image/png;base64,%s)\n\n", i+1, b64))
 	}
@@ -745,4 +748,35 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 			},
 		})
 	}
+}
+
+// fetchImageWithHeaders 专门用于拉取 Gemini 的 lh3.googleusercontent.com 图片
+func fetchImageWithHeaders(urlStr string) ([]byte, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// 关键 Headers（模拟浏览器从 Gemini 页面访问）
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://gemini.google.com/")
+	req.Header.Set("Origin", "https://gemini.google.com")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("image fetch failed with status: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }

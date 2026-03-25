@@ -8,7 +8,6 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// extractImageURLsFromResponse 通过递归搜索响应体中的所有有效图片 URL
 func extractImageURLsFromResponse(reader io.Reader) []string {
 	var urls []string
 
@@ -27,22 +26,22 @@ func extractImageURLsFromResponse(reader io.Reader) []string {
 			val := res.String()
 			valTrimmed := strings.TrimSpace(val)
 
-			// 检查是否是目标图片 URL
-			// 启发式规则：包含 googleusercontent.com，并且绝对不是用户头像 (/profile/)
-			if strings.HasPrefix(valTrimmed, "http") &&
+			// 【关键修复】更严格的图片URL启发式规则
+			if strings.HasPrefix(valTrimmed, "https://") && // 必须是 https（排除 http://.../image_generation_content/0）
 				strings.Contains(valTrimmed, "googleusercontent.com") &&
-				!strings.Contains(valTrimmed, "/profile/picture/") {
+				strings.Contains(valTrimmed, "lh") && // Gemini 生成的图片几乎都在 lh3/lh4... 子域
+				len(valTrimmed) > 120 && // 真实图片URL极长（>300字符），排除短的垃圾字符串
+				!strings.Contains(valTrimmed, "/profile/picture/") &&
+				!strings.Contains(valTrimmed, "image_generation_content") { // 额外排除 Gemini 内部占位符
 
 				// 去重并添加到结果中
 				if !seen[valTrimmed] {
 					seen[valTrimmed] = true
 					urls = append(urls, valTrimmed)
 				}
-				return
 			}
 
 			// 检查是否是“字符串化的 JSON” (Stringified JSON)
-			// Gemini 的 payload 经常把复杂的 JSON 数组或对象压缩成一个字符串
 			if (strings.HasPrefix(valTrimmed, "[") && strings.HasSuffix(valTrimmed, "]")) ||
 				(strings.HasPrefix(valTrimmed, "{") && strings.HasSuffix(valTrimmed, "}")) {
 

@@ -583,7 +583,9 @@ func downloadImageAsBase64(url string, cookies map[string]string) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
-func extractImageURLsFromResponse(reader io.Reader) []string {
+/*func extractImageURLsFromResponse(reader io.Reader) []string {
+	log.Printf("[Images] Extracting image URLs from response")
+
 	var urls []string
 	var allParts []gjson.Result
 
@@ -652,25 +654,75 @@ func extractImageURLsFromResponse(reader io.Reader) []string {
 	}
 
 	return urls
-}
+}*/
 
 func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatRequest) {
+	log.Printf("[Images-Debug] 🚀 进入 handleImageChatRequest, 准备处理模型: %s", req.Model)
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 
-	// Extract prompt from last user message
-	var prompt string
+	var promptBuilder strings.Builder
+	var files []gemini.FileData
+
+	// 提取最后一条用户消息的内容和图片
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if strings.EqualFold(req.Messages[i].Role, "user") {
 			switch content := req.Messages[i].Content.(type) {
 			case string:
-				prompt = content
+				promptBuilder.WriteString(content)
 			case []interface{}:
 				for _, part := range content {
 					if m, ok := part.(map[string]interface{}); ok {
-						if text, ok := m["text"].(string); ok {
-							prompt = text
-							break
+						typeStr, _ := m["type"].(string)
+
+						if typeStr == "text" {
+							if text, ok := m["text"].(string); ok {
+								promptBuilder.WriteString(text)
+							}
+						} else if typeStr == "image_url" {
+							if imgMap, ok := m["image_url"].(map[string]interface{}); ok {
+								if urlStr, ok := imgMap["url"].(string); ok {
+									if strings.HasPrefix(urlStr, "data:") {
+										// 💡 改进 1：使用 SplitN 防止 base64 串中自带逗号导致越界
+										parts := strings.SplitN(urlStr, ",", 2)
+										if len(parts) == 2 {
+											// 💡 改进 2：强力清理 Spring AI 可能传来的换行符和空格
+											cleanB64 := strings.ReplaceAll(parts[1], "\n", "")
+											cleanB64 = strings.ReplaceAll(cleanB64, "\r", "")
+											cleanB64 = strings.ReplaceAll(cleanB64, " ", "")
+
+											data, err := base64.StdEncoding.DecodeString(cleanB64)
+											if err != nil {
+												// 尝试备用解码
+												data, err = base64.URLEncoding.DecodeString(cleanB64)
+											}
+
+											if err == nil {
+												log.Printf("[Images-Debug] ✅ 成功解码 Base64, 大小: %d bytes. 准备上传到 Google...", len(data))
+												fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
+
+												// ⚠️ 注意：这里可能会因为网络代理问题卡住
+												fid, err := client.UploadFile(data, fname)
+
+												if err == nil {
+													log.Printf("[Images-Debug] ☁️ 图片上传 Google 成功！FID: %s", fid)
+													files = append(files, gemini.FileData{
+														URL:      fid,
+														FileName: fname,
+													})
+													promptBuilder.WriteString("[Image]")
+												} else {
+													log.Printf("[Images-Debug] ❌ 图片上传失败: %v", err)
+												}
+											} else {
+												log.Printf("[Images-Debug] ❌ Base64 解码彻底失败: %v", err)
+											}
+										}
+									} else {
+										promptBuilder.WriteString(fmt.Sprintf("[Image URL: %s]", urlStr))
+									}
+								}
+							}
 						}
 					}
 				}
@@ -679,21 +731,36 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 		}
 	}
 
+	prompt := promptBuilder.String()
+	log.Printf("[Images-Debug] 📝 最终组装的 Prompt: %s, 共包含 %d 张附件", prompt, len(files))
+
 	if prompt == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No prompt found in messages"})
 		return
 	}
 
-	respBody, err := client.StreamGenerateContent(fmt.Sprintf("Generate an image of %s", prompt), req.Model, nil, nil)
+	finalPrompt := prompt
+	if len(files) == 0 {
+		finalPrompt = fmt.Sprintf("Generate an image of %s", prompt)
+	}
+
+	log.Printf("[Images-Debug] ⏳ 开始调用底层 StreamGenerateContent 接口...")
+	respBody, err := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
 	if err != nil {
+		log.Printf("[Images-Debug] 💥 底层接口调用崩溃报错: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	defer respBody.Close()
 
+	log.Printf("[Images-Debug] 📥 底层接口调用成功，正在提取返回的图片 URL...")
 	imageURLs := extractImageURLsFromResponse(respBody)
 
+	log.Printf("[imageURLs], %s", imageURLs)
+
+	// ========== 下方代码保持原样 ==========
 	if len(imageURLs) == 0 {
+		log.Printf("[Images-Debug] ⚠️ 未能从 Google 响应中提取到任何图片")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
 			"message": "No images generated",
 			"type":    "server_error",
@@ -701,7 +768,6 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 		return
 	}
 
-	// Download images using gemini client
 	var content strings.Builder
 	for i, imgURL := range imageURLs {
 		fullURL := imgURL

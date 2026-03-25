@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -215,6 +216,11 @@ func extractImagesFromResponse(reader io.Reader, format string, cookies map[stri
 				return true
 			}
 
+			if strings.Contains(url, "/profile/picture/") {
+				log.Printf("[Images] 跳过无效图片(头像): %s", url)
+				return true // return true 在 gjson.ForEach 中代表 continue（跳过当前并继续下一个）
+			}
+
 			if strings.HasPrefix(url, "http://googleusercontent.com/image_generation_content") {
 				return true
 			}
@@ -269,12 +275,18 @@ func getNestedValueStr(data interface{}, path []int) string {
 	return str
 }
 
-func fetchImageWithCookies(url string, cookies map[string]string) string {
+func fetchImageWithCookies(urlStr string, cookies map[string]string) string {
+
+	proxyUrl, err := url.Parse("http://127.0.0.1:7897")
+
 	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyUrl), // 强制 Client 走代理
+		},
 		Timeout: 60 * time.Second,
 	}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		log.Printf("[Images] Failed to create request: %v", err)
 		return ""
@@ -287,6 +299,7 @@ func fetchImageWithCookies(url string, cookies map[string]string) string {
 	for k, v := range cookies {
 		cookieParts = append(cookieParts, k+"="+v)
 	}
+
 	if len(cookieParts) > 0 {
 		req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
 	}
@@ -299,7 +312,7 @@ func fetchImageWithCookies(url string, cookies map[string]string) string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		log.Printf("[Images] Image fetch returned status %d for URL: %s", resp.StatusCode, url[:minInt(len(url), 80)])
+		log.Printf("[Images] Image fetch returned status %d for URL: %s", resp.StatusCode, urlStr[:minInt(len(urlStr), 80)])
 		return ""
 	}
 

@@ -703,7 +703,7 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 			fullURL = imgURL + "=s2048" // 保持你原来的缩放逻辑
 		}
 
-		data, err := fetchImageWithHeaders(fullURL)
+		data, err := client.FetchImage(fullURL)
 		if err != nil {
 			log.Printf("[Images] Failed to fetch image: %v (URL: %s)", err, fullURL)
 			continue

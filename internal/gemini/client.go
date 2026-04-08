@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -45,6 +47,10 @@ func NewClient(cookies map[string]string, proxyURL string) (*Client, error) {
 	profile := GetRandomProfile()
 
 	options := GetClientOptions(profile, proxyURL)
+
+	options = append(options, tls_client.WithForceHttp1())
+
+	// 使用包含降级选项的 options 创建 client
 	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
 	if err != nil {
 		return nil, err
@@ -272,6 +278,181 @@ func (c *Client) FetchImage(imageURL string) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("too many redirects")
+}
+
+func (c *Client) FetchImage1(imageURL string) ([]byte, error) {
+	maxRedirects := 5
+	currentURL := imageURL
+
+	// 1. 基础延迟 1 秒
+	baseDelay := time.Second
+
+	// 2. 额外生成 0 ~ 1 秒之间的随机时间 (纳秒级精度)
+	// rand.Int63n 接受一个 int64 类型的值，并返回 [0, n) 范围的随机数
+	extraDelay := time.Duration(rand.Int63n(int64(time.Second)))
+
+	// 3. 计算总延迟时间 (1秒 ~ 2秒)
+	totalDelay := baseDelay + extraDelay
+
+	// 执行延迟
+	fmt.Printf("开始睡眠，随机延迟时间为: %v\n", totalDelay)
+	time.Sleep(totalDelay)
+
+	for i := 0; i < maxRedirects; i++ {
+		req, err := http.NewRequest(http.MethodGet, currentURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("创建请求失败: %w", err)
+		}
+
+		// 1. 每次重定向都重新注入 Cookie (保留你的原逻辑)
+		for k, v := range c.Cookies {
+			req.AddCookie(&http.Cookie{Name: k, Value: v})
+		}
+
+		// 2. 设置伪装 Headers
+		req.Header.Set("User-Agent", GetCurrentUserAgent())
+		req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+		req.Header.Set("Referer", "https://googleusercontent.com/")
+
+		// 3. 解决 unexpected EOF 的杀手锏：禁用连接复用
+		req.Close = true
+
+		// 发起请求
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("请求执行失败: %w", err)
+		}
+
+		// 4. 手动处理 3xx 重定向
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close() // 关键：丢弃当前响应体，释放资源
+
+			if location == "" {
+				return nil, fmt.Errorf("遇到重定向状态码 %d，但没有 Location 头", resp.StatusCode)
+			}
+
+			// 处理 Location 可能是相对路径的情况 (兼容性更好)
+			u, err := resp.Request.URL.Parse(location)
+			if err != nil {
+				return nil, fmt.Errorf("解析重定向 URL 失败: %w", err)
+			}
+
+			currentURL = u.String()
+			continue // 拿着新的 URL 进入下一次循环
+		}
+
+		// 5. 处理最终结果，必须 defer 关闭成功后的 Body
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("图片获取失败，最终状态码: %d", resp.StatusCode)
+		}
+
+		// 6. 安全读取数据
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("读取图片流时中断 (unexpected EOF): %w", err)
+		}
+
+		return data, nil
+	}
+
+	return nil, fmt.Errorf("重定向次数超过限制 (%d 次)", maxRedirects)
+}
+
+func (c *Client) FetchImage2(imageURL string) ([]byte, error) {
+	maxRetries := 3 // 整个流程最多重试 3 次
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			// 如果是重试，稍微等一下，避免被 Google 的高频检测拦截
+			time.Sleep(time.Duration(attempt) * time.Second)
+			fmt.Printf("第 %d 次尝试重新下载图片: %s\n", attempt+1, imageURL)
+		}
+
+		data, err := c.doFetchImage(imageURL)
+		if err == nil {
+			return data, nil // 成功下载，直接返回
+		}
+		lastErr = err
+
+		// 只有遇到 EOF 或者网络相关的错误时才重试
+		if !strings.Contains(err.Error(), "EOF") && !strings.Contains(err.Error(), "connection") {
+			return nil, err // 如果是 404 等明确的错误，就不重试了
+		}
+	}
+
+	return nil, fmt.Errorf("重试 %d 次后仍然失败, 最后一次错误: %w", maxRetries, lastErr)
+}
+
+// 这是你之前的核心逻辑，稍微做了一点防断流的升级
+func (c *Client) doFetchImage(imageURL string) ([]byte, error) {
+	maxRedirects := 5
+	currentURL := imageURL
+
+	for i := 0; i < maxRedirects; i++ {
+		req, err := http.NewRequest(http.MethodGet, currentURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("创建请求失败: %w", err)
+		}
+
+		for k, v := range c.Cookies {
+			req.AddCookie(&http.Cookie{Name: k, Value: v})
+		}
+
+		req.Header.Set("User-Agent", GetCurrentUserAgent())
+		req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+		req.Header.Set("Referer", "https://googleusercontent.com/")
+
+		// 🌟 关键新增：强制要求服务器返回未压缩的原始数据 (identity)，防止代理软件解压失败导致 EOF
+		req.Header.Set("Accept-Encoding", "identity")
+
+		req.Close = true
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("请求执行失败: %w", err)
+		}
+
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			location := resp.Header.Get("Location")
+			resp.Body.Close()
+
+			if location == "" {
+				return nil, fmt.Errorf("遇到重定向状态码 %d，但没有 Location 头", resp.StatusCode)
+			}
+
+			u, err := resp.Request.URL.Parse(location)
+			if err != nil {
+				return nil, fmt.Errorf("解析重定向 URL 失败: %w", err)
+			}
+			currentURL = u.String()
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("图片获取失败，最终状态码: %d", resp.StatusCode)
+		}
+
+		// 🌟 增加对 ioutil.ReadAll 的保护
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			// 哪怕发生了 EOF，如果其实已经读到了数据，我们可以选择“原谅”它
+			if len(data) > 0 {
+				fmt.Printf("警告: 读取时发生 %v, 但已获取 %d bytes, 尝试继续...\n", err, len(data))
+				return data, nil
+			}
+			return nil, fmt.Errorf("读取图片流时中断 (unexpected EOF): %w", err)
+		}
+
+		return data, nil
+	}
+
+	return nil, fmt.Errorf("重定向次数超过限制")
 }
 
 func GetLanguage() string {

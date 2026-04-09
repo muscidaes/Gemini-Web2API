@@ -683,13 +683,32 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 	log.Printf("[Images-Debug] 📥 底层接口调用成功，正在提取返回的图片 URL...")
 	imageURLs := extractImageURLsFromResponse(respBody)
 
-	log.Printf("[imageURLs], %s", imageURLs)
-
-	// ========== 下方代码保持原样 ==========
+	// 如果提取不到图片，尝试刷新 Cookie 并重试一次
 	if len(imageURLs) == 0 {
-		log.Printf("[Images-Debug] ⚠️ 未能从 Google 响应中提取到任何图片")
+		log.Printf("[Images-Debug] ⚠️ 未能从 Google 响应中提取到任何图片，尝试刷新 Cookie 并重试...")
+		respBody.Close() // 关闭旧的响应流
+
+		if refreshErr := client.RefreshCookies(); refreshErr == nil {
+			log.Printf("[Images-Debug] 🔄 Cookie 刷新成功，正在重试请求...")
+			retryRespBody, retryErr := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
+			if retryErr == nil {
+				respBody = retryRespBody
+				imageURLs = extractImageURLsFromResponse(respBody)
+				log.Printf("[Images-Debug] 🔄 重试后提取到的图片数量: %d", len(imageURLs))
+			} else {
+				log.Printf("[Images-Debug] ❌ 重试请求失败: %v", retryErr)
+			}
+		} else {
+			log.Printf("[Images-Debug] ❌ 刷新 Cookie 失败: %v", refreshErr)
+		}
+	}
+
+	log.Printf("[imageURLs], %v", imageURLs)
+
+	if len(imageURLs) == 0 {
+		log.Printf("[Images-Debug] ⚠️ 最终未能从 Google 响应中提取到任何图片")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{
-			"message": "No images generated",
+			"message": "No images generated after retry",
 			"type":    "server_error",
 		}})
 		return

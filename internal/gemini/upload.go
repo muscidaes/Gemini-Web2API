@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -15,6 +16,10 @@ const (
 )
 
 func (c *Client) UploadFile(data []byte, filename string) (string, error) {
+	return c.doUploadFile(data, filename, true)
+}
+
+func (c *Client) doUploadFile(data []byte, filename string, retry bool) (string, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
@@ -48,6 +53,14 @@ func (c *Client) UploadFile(data []byte, filename string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		if retry {
+			log.Printf("账号 '%s' 图片上传失败 (状态码 %d)，尝试刷新 Cookie 并重试...", c.displayAccountID(), resp.StatusCode)
+			if refreshErr := c.RefreshCookies(); refreshErr == nil {
+				return c.doUploadFile(data, filename, false)
+			} else {
+				log.Printf("账号 '%s' 刷新 Cookie 失败: %v", c.displayAccountID(), refreshErr)
+			}
+		}
 		return "", fmt.Errorf("upload failed with status: %d", resp.StatusCode)
 	}
 

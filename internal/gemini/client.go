@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"gemini-web2api/internal/browser"
+
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 )
@@ -148,40 +150,71 @@ func (c *Client) Init() error {
 	return nil
 }
 
+func (c *Client) RefreshCookies() error {
+	log.Printf("账号 '%s' 正在自动重新从浏览器获取 Cookie...", c.displayAccountID())
+	newCookies, err := browser.LoadCookiesFromBrowser()
+	if err != nil {
+		return fmt.Errorf("自动获取 Cookie 失败: %v", err)
+	}
+
+	// 构造带后缀的 Map 以便保存到 .env
+	saveMap := make(map[string]string)
+	suffix := ""
+	if c.AccountID != "" {
+		suffix = "_" + c.AccountID
+	}
+	saveMap["__Secure-1PSID"+suffix] = newCookies["__Secure-1PSID"]
+	saveMap["__Secure-1PSIDTS"+suffix] = newCookies["__Secure-1PSIDTS"]
+	browser.SaveToEnv(saveMap)
+
+	c.Cookies = newCookies
+	u, _ := url.Parse("https://gemini.google.com")
+	var cookieList []*http.Cookie
+	for k, v := range newCookies {
+		cookieList = append(cookieList, &http.Cookie{
+			Name:   k,
+			Value:  v,
+			Domain: ".google.com",
+			Path:   "/",
+		})
+	}
+	c.httpClient.SetCookies(u, cookieList)
+
+	log.Printf("账号 '%s' 已装载新获取的 Cookie，正在重新初始化...", c.displayAccountID())
+	return c.Init()
+}
+
 func (c *Client) StreamGenerateContent(prompt string, model string, files []FileData, meta *ChatMetadata) (io.ReadCloser, error) {
 	resp, err := c.doGenerateContentRequest(prompt, model, files, meta)
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusForbidden {
-		preview := readBodyPreview(resp.Body)
-		resp.Body.Close()
-		log.Printf("账号 '%s' 请求返回 403，准备重新初始化后重试。响应预览: %s", c.displayAccountID(), preview)
-
-		if err := c.Init(); err != nil {
-			return nil, err
-		}
-
-		resp, err = c.doGenerateContentRequest(prompt, model, files, meta)
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode == http.StatusForbidden {
-			preview = readBodyPreview(resp.Body)
-			resp.Body.Close()
-			log.Printf("账号 '%s' 重新初始化后仍然返回 403。响应预览: %s", c.displayAccountID(), preview)
-			return nil, fmt.Errorf("Account authentication failed (403). Cookie may be expired. Please update cookies in .env")
-		}
-	}
-
+	// 如果状态码不为 200，触发 Cookie 刷新
 	if resp.StatusCode != http.StatusOK {
 		preview := readBodyPreview(resp.Body)
 		statusCode := resp.StatusCode
 		resp.Body.Close()
 		log.Printf("账号 '%s' 请求失败，状态码 %d，响应预览: %s", c.displayAccountID(), statusCode, preview)
-		return nil, fmt.Errorf("generate request failed with status: %d", statusCode)
+
+		if err := c.RefreshCookies(); err != nil {
+			log.Printf("账号 '%s' 刷新 Cookie 失败: %v", c.displayAccountID(), err)
+			return nil, fmt.Errorf("generate request failed with status: %d and refresh failed: %v", statusCode, err)
+		}
+
+		// 刷新成功后重试一次
+		log.Printf("账号 '%s' Cookie 刷新成功，正在重试请求...", c.displayAccountID())
+		resp, err = c.doGenerateContentRequest(prompt, model, files, meta)
+		if err != nil {
+			return nil, err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			preview = readBodyPreview(resp.Body)
+			resp.Body.Close()
+			log.Printf("账号 '%s' 重试请求仍然失败，状态码 %d，响应预览: %s", c.displayAccountID(), resp.StatusCode, preview)
+			return nil, fmt.Errorf("generate request failed with status: %d after refresh", resp.StatusCode)
+		}
 	}
 
 	return resp.Body, nil
@@ -281,6 +314,10 @@ func (c *Client) FetchImage(imageURL string) ([]byte, error) {
 }
 
 func (c *Client) FetchImage1(imageURL string) ([]byte, error) {
+	return c.doFetchImageWithRetry(imageURL, true)
+}
+
+func (c *Client) doFetchImageWithRetry(imageURL string, retry bool) ([]byte, error) {
 	maxRedirects := 5
 	currentURL := imageURL
 
@@ -346,6 +383,12 @@ func (c *Client) FetchImage1(imageURL string) ([]byte, error) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			if retry && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized) {
+				log.Printf("账号 '%s' 下载图片返回 %d，尝试刷新 Cookie 并重试...", c.displayAccountID(), resp.StatusCode)
+				if refreshErr := c.RefreshCookies(); refreshErr == nil {
+					return c.doFetchImageWithRetry(imageURL, false)
+				}
+			}
 			return nil, fmt.Errorf("图片获取失败，最终状态码: %d", resp.StatusCode)
 		}
 

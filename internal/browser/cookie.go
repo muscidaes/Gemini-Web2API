@@ -49,7 +49,7 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func loadCookiesFromBrowser() (map[string]string, error) {
+func LoadCookiesFromBrowser() (map[string]string, error) {
 	cookies := make(map[string]string)
 
 	fmt.Println("Attempting to read cookies from Firefox...")
@@ -106,12 +106,12 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 	content, err := os.ReadFile(".env")
 	if err != nil {
 		fmt.Println(".env file not found, attempting to auto-detect cookies from browser...")
-		cookies, browserErr := loadCookiesFromBrowser()
+		cookies, browserErr := LoadCookiesFromBrowser()
 		if browserErr != nil {
 			createEnvTemplate()
 			return nil, nil, nil, fmt.Errorf("failed to auto-detect cookies: %v. A template .env file has been created", browserErr)
 		}
-		saveToEnv(cookies)
+		SaveToEnv(cookies)
 		results = append(results, cookies)
 		usedIDs = append(usedIDs, "")
 		proxyURLs = append(proxyURLs, strings.TrimSpace(os.Getenv("PROXY")))
@@ -149,11 +149,11 @@ func LoadMultiCookies(accountIDs []string) ([]map[string]string, []string, []str
 
 	if len(accountIDs) == 0 {
 		fmt.Println("No accounts configured in .env, attempting to auto-detect cookies from browser...")
-		cookies, browserErr := loadCookiesFromBrowser()
+		cookies, browserErr := LoadCookiesFromBrowser()
 		if browserErr != nil {
 			return nil, nil, nil, fmt.Errorf("no accounts in .env and failed to auto-detect: %v", browserErr)
 		}
-		saveToEnv(cookies)
+		SaveToEnv(cookies)
 		results = append(results, cookies)
 		usedIDs = append(usedIDs, "")
 		proxyURLs = append(proxyURLs, strings.TrimSpace(envMap["PROXY"]))
@@ -240,7 +240,7 @@ func ParseAccountIDs(s string) []string {
 	return ids
 }
 
-func saveToEnv(cookies map[string]string) {
+func SaveToEnv(cookies map[string]string) {
 	content, err := os.ReadFile(".env")
 	envMap := make(map[string]string)
 	lines := []string{}

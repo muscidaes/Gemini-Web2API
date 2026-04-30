@@ -56,11 +56,6 @@ func main() {
 	r.POST("/v1/images/generations", adapter.ImageGenerationHandler(pool))
 	r.GET("/v1/models", adapter.ListModelsHandler)
 
-	// Claude Protocol
-	r.POST("/v1/messages", adapter.ClaudeMessagesHandler(pool))
-	r.POST("/v1/messages/count_tokens", adapter.ClaudeCountTokensHandler(pool))
-	r.GET("/v1/models/claude", adapter.ClaudeListModelsHandler)
-
 	r.POST("/v1beta/models/*action", adapter.GeminiRouterHandler(pool))
 	r.GET("/v1beta/models", adapter.GeminiListModelsHandler)
 

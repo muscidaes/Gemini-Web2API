@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,9 +139,14 @@ func loadAccountsAsync() {
 
 	var wg sync.WaitGroup
 
+	type initResult struct {
+		client *gemini.Client
+		err    error
+	}
+
 	for _, idx := range toInit {
 		wg.Add(1)
-		go func(i int, c map[string]string, proxyURL string) {
+		go func(i int, cookies map[string]string, proxyURL string) {
 			defer wg.Done()
 
 			displayID := accountIDs[i]
@@ -153,30 +159,62 @@ func loadAccountsAsync() {
 
 			const maxRetries = 3
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 
-				done := make(chan error, 1)
-				var client *gemini.Client
+				done := make(chan initResult, 1)
 
-				go func() {
-					var err error
-					client, err = gemini.NewClient(c, proxyURL)
+				go func(c map[string]string) {
+					client, err := gemini.NewClient(c, proxyURL)
 					if err != nil {
-						done <- err
+						done <- initResult{err: err}
 						return
 					}
 					client.AccountID = accountIDs[i]
-					done <- client.Init()
-				}()
+					err = client.Init()
+					done <- initResult{client: client, err: err}
+				}(cookies)
 
 				select {
-				case err := <-done:
+				case res := <-done:
 					cancel()
+					client := res.client
+					err := res.err
+
 					if err == nil {
 						results <- accountResult{entry: balancer.AccountEntry{Client: client, AccountID: accountIDs[i], ProxyURL: proxyURL}}
 						log.Printf("Account '%s': ready", displayID)
 						return
 					}
+
+					// 尝试匹配各种可能的 Cookie 失效错误
+					errMsg := err.Error()
+					isCookieError := strings.Contains(errMsg, "SNlM0e") ||
+						strings.Contains(errMsg, "token not found") ||
+						strings.Contains(errMsg, "Cookies might be invalid") ||
+						strings.Contains(errMsg, "invalid")
+
+					if isCookieError {
+						log.Printf("账号 '%s' 初始化失败 (错误: %s)，正在触发 Cookie 自动刷新...", displayID, errMsg)
+						if client == nil {
+							// 兜底逻辑：如果 client 是 nil，尝试创建一个
+							log.Printf("Account '%s': client is nil, creating new client for refresh...", displayID)
+							client, _ = gemini.NewClient(cookies, proxyURL)
+							if client != nil {
+								client.AccountID = accountIDs[i]
+							}
+						}
+
+						if client != nil {
+							if refreshErr := client.RefreshCookies(); refreshErr == nil {
+								results <- accountResult{entry: balancer.AccountEntry{Client: client, AccountID: accountIDs[i], ProxyURL: proxyURL}}
+								log.Printf("Account '%s': ready after auto-refresh", displayID)
+								return
+							} else {
+								log.Printf("Account '%s': auto-refresh failed: %v", displayID, refreshErr)
+							}
+						}
+					}
+
 					if attempt < maxRetries {
 						log.Printf("Account '%s': init failed (attempt %d/%d): %v, retrying in 2s...", displayID, attempt, maxRetries, err)
 						time.Sleep(2 * time.Second)

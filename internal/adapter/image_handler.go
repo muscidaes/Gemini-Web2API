@@ -104,7 +104,7 @@ func ImageGenerationHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 		var errors []string
 
 		for i := 0; i < req.N; i++ {
-			respBody, err := client.StreamGenerateContent(finalPrompt, req.Model, nil, nil)
+			respBody, err := client.StreamGenerateContent(c.Request.Context(), finalPrompt, req.Model, nil, nil)
 			if err != nil {
 				log.Printf("[Images] Request %d failed: %v", i, err)
 				errors = append(errors, err.Error())

@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -15,11 +16,11 @@ const (
 	UploadPushID   = "feeds/mcudyrk2a4khkz"
 )
 
-func (c *Client) UploadFile(data []byte, filename string) (string, error) {
-	return c.doUploadFile(data, filename, true)
+func (c *Client) UploadFile(ctx context.Context, data []byte, filename string) (string, error) {
+	return c.doUploadFile(ctx, data, filename, true)
 }
 
-func (c *Client) doUploadFile(data []byte, filename string, retry bool) (string, error) {
+func (c *Client) doUploadFile(ctx context.Context, data []byte, filename string, retry bool) (string, error) {
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
@@ -40,6 +41,7 @@ func (c *Client) doUploadFile(data []byte, filename string, retry bool) (string,
 	if err != nil {
 		return "", err
 	}
+	req = req.WithContext(ctx)
 
 	req.Header.Set("Push-ID", UploadPushID)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -56,7 +58,7 @@ func (c *Client) doUploadFile(data []byte, filename string, retry bool) (string,
 		if retry {
 			log.Printf("账号 '%s' 图片上传失败 (状态码 %d)，尝试刷新 Cookie 并重试...", c.displayAccountID(), resp.StatusCode)
 			if refreshErr := c.RefreshCookies(); refreshErr == nil {
-				return c.doUploadFile(data, filename, false)
+				return c.doUploadFile(ctx, data, filename, false)
 			} else {
 				log.Printf("账号 '%s' 刷新 Cookie 失败: %v", c.displayAccountID(), refreshErr)
 			}

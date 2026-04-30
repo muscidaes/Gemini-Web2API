@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -119,7 +120,7 @@ func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model str
 		log.Printf("[Gemini] 模型映射: %s -> %s", model, mappedModel)
 	}
 
-	prompt, files := buildGeminiPrompt(&req, client)
+	prompt, files := buildGeminiPrompt(c.Request.Context(), &req, client)
 	if strings.TrimSpace(prompt) == "" {
 		prompt = "Hello"
 	}
@@ -127,7 +128,7 @@ func geminiGenerateContent(c *gin.Context, pool *balancer.AccountPool, model str
 	log.Printf("[Gemini] 请求 | 模型: %s | 流式: false | 内容段: %d | 文件: %d", model, len(req.Contents), len(files))
 
 	gemini.RandomDelay()
-	respBody, err := client.StreamGenerateContent(prompt, mappedModel, files, nil)
+	respBody, err := client.StreamGenerateContent(c.Request.Context(), prompt, mappedModel, files, nil)
 	if err != nil {
 		log.Printf("[Gemini] 请求失败: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -188,7 +189,7 @@ func geminiStreamGenerateContent(c *gin.Context, pool *balancer.AccountPool, mod
 		log.Printf("[Gemini] 模型映射: %s -> %s", model, mappedModel)
 	}
 
-	prompt, files := buildGeminiPrompt(&req, client)
+	prompt, files := buildGeminiPrompt(c.Request.Context(), &req, client)
 	if strings.TrimSpace(prompt) == "" {
 		prompt = "Hello"
 	}
@@ -196,7 +197,7 @@ func geminiStreamGenerateContent(c *gin.Context, pool *balancer.AccountPool, mod
 	log.Printf("[Gemini] 请求 | 模型: %s | 流式: true | 内容段: %d | 文件: %d", model, len(req.Contents), len(files))
 
 	gemini.RandomDelay()
-	respBody, err := client.StreamGenerateContent(prompt, mappedModel, files, nil)
+	respBody, err := client.StreamGenerateContent(c.Request.Context(), prompt, mappedModel, files, nil)
 	if err != nil {
 		log.Printf("[Gemini] 请求失败: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -275,20 +276,20 @@ func GeminiListModelsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": models})
 }
 
-func buildGeminiPrompt(req *GeminiGenerateContentRequest, client *gemini.Client) (string, []gemini.FileData) {
+func buildGeminiPrompt(ctx context.Context, req *GeminiGenerateContentRequest, client *gemini.Client) (string, []gemini.FileData) {
 	var builder strings.Builder
 	var files []gemini.FileData
 
 	if req.SystemInstruction != nil {
 		builder.WriteString("**System**: ")
-		appendGeminiParts(&builder, client, &files, req.SystemInstruction.Parts)
+		appendGeminiParts(ctx, &builder, client, &files, req.SystemInstruction.Parts)
 		builder.WriteString("\n\n")
 	}
 
 	for _, content := range req.Contents {
 		roleLabel := roleToPromptLabel(content.Role)
 		builder.WriteString(fmt.Sprintf("**%s**: ", roleLabel))
-		appendGeminiParts(&builder, client, &files, content.Parts)
+		appendGeminiParts(ctx, &builder, client, &files, content.Parts)
 		builder.WriteString("\n\n")
 	}
 
@@ -306,7 +307,7 @@ func roleToPromptLabel(role string) string {
 	}
 }
 
-func appendGeminiParts(builder *strings.Builder, client *gemini.Client, files *[]gemini.FileData, parts []GeminiPart) {
+func appendGeminiParts(ctx context.Context, builder *strings.Builder, client *gemini.Client, files *[]gemini.FileData, parts []GeminiPart) {
 	for _, part := range parts {
 		if part.Text != "" {
 			builder.WriteString(part.Text)
@@ -337,7 +338,7 @@ func appendGeminiParts(builder *strings.Builder, client *gemini.Client, files *[
 		ext := mimeTypeToExt(mimeType)
 		filename := fmt.Sprintf("inline_%d%s", time.Now().UnixNano(), ext)
 
-		fid, err := client.UploadFile(data, filename)
+		fid, err := client.UploadFile(ctx, data, filename)
 		if err != nil {
 			log.Printf("[Gemini] 上传图片失败: %v", err)
 			continue

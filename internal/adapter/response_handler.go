@@ -3,6 +3,7 @@ package adapter
 import (
 	"io"
 	"log"
+	"regexp"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -27,10 +28,10 @@ func extractImageURLsFromResponse(reader io.Reader) []string {
 			valTrimmed := strings.TrimSpace(val)
 
 			// 【关键修复】更严格的图片URL启发式规则
-			if strings.HasPrefix(valTrimmed, "https://") && // 必须是 https（排除 http://.../image_generation_content/0）
+			if strings.HasPrefix(valTrimmed, "https://") && // 必须是 https
 				strings.Contains(valTrimmed, "googleusercontent.com") &&
-				strings.Contains(valTrimmed, "lh") && // Gemini 生成的图片几乎都在 lh3/lh4... 子域
-				len(valTrimmed) > 120 && // 真实图片URL极长（>300字符），排除短的垃圾字符串
+				(strings.Contains(valTrimmed, "lh") || strings.Contains(valTrimmed, "encrypted-tbn")) && // 放宽：lh 子域或 encrypted-tbn
+				len(valTrimmed) > 80 && // 略微放宽长度要求 (原 120)
 				!strings.Contains(valTrimmed, "/profile/picture/") &&
 				!strings.Contains(valTrimmed, "image_generation_content") { // 额外排除 Gemini 内部占位符
 
@@ -64,7 +65,8 @@ func extractImageURLsFromResponse(reader io.Reader) []string {
 	}
 
 	// 逐行处理 payload (处理多段下发的流式 JSON)
-	for _, line := range strings.Split(string(content), "\n") {
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
 		// 清理 Google 特有的安全前缀
 		line = strings.TrimPrefix(line, ")]}'")
 		line = strings.TrimSpace(line)
@@ -75,6 +77,18 @@ func extractImageURLsFromResponse(reader io.Reader) []string {
 		// 解析最外层 JSON，并将其送入递归扫描器
 		outer := gjson.Parse(line)
 		searchForURLs(outer)
+	}
+
+	// 如果常规提取失败，尝试正则表达式匹配 (兜底方案)
+	if len(urls) == 0 {
+		re := regexp.MustCompile(`https://lh\d+\.googleusercontent\.com/[a-zA-Z0-9\-_=]{80,}`)
+		matches := re.FindAllString(string(content), -1)
+		for _, match := range matches {
+			if !seen[match] {
+				seen[match] = true
+				urls = append(urls, match)
+			}
+		}
 	}
 
 	return urls

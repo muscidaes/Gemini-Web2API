@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -105,7 +106,7 @@ func (c *Client) Init() error {
 	reSN := regexp.MustCompile(`"SNlM0e":"(.*?)"`)
 	matchSN := reSN.FindStringSubmatch(bodyString)
 	if len(matchSN) < 2 {
-		return fmt.Errorf("account '%s' SNlM0e token not found. Cookies might be invalid", c.displayAccountID())
+		return fmt.Errorf("SNlM0e token not found in response. This usually means cookies are invalid or expired (account: %s)", c.displayAccountID())
 	}
 	c.SNlM0e = matchSN[1]
 
@@ -151,18 +152,27 @@ func (c *Client) Init() error {
 }
 
 func (c *Client) RefreshCookies() error {
-	log.Printf("账号 '%s' 正在自动重新从浏览器获取 Cookie...", c.displayAccountID())
-	newCookies, err := browser.LoadCookiesFromBrowser()
-	if err != nil {
-		return fmt.Errorf("自动获取 Cookie 失败: %v", err)
-	}
+	displayID := c.displayAccountID()
+	log.Printf("账号 '%s' 的旧 Cookie 已失效，正在从 .env 移除并尝试从浏览器重新获取...", displayID)
 
-	// 构造带后缀的 Map 以便保存到 .env
-	saveMap := make(map[string]string)
+	// 1. 先构造一个清空旧 Cookie 的 map 并保存（模拟“移除”动作）
 	suffix := ""
 	if c.AccountID != "" {
 		suffix = "_" + c.AccountID
 	}
+	clearMap := make(map[string]string)
+	clearMap["__Secure-1PSID"+suffix] = ""
+	clearMap["__Secure-1PSIDTS"+suffix] = ""
+	browser.SaveToEnv(clearMap)
+
+	// 2. 从浏览器加载新 Cookie
+	newCookies, err := browser.LoadCookiesFromBrowser()
+	if err != nil {
+		return fmt.Errorf("自动获取新 Cookie 失败: %v", err)
+	}
+
+	// 3. 将新 Cookie 保存到 .env 并装载到当前客户端
+	saveMap := make(map[string]string)
 	saveMap["__Secure-1PSID"+suffix] = newCookies["__Secure-1PSID"]
 	saveMap["__Secure-1PSIDTS"+suffix] = newCookies["__Secure-1PSIDTS"]
 	browser.SaveToEnv(saveMap)
@@ -180,12 +190,12 @@ func (c *Client) RefreshCookies() error {
 	}
 	c.httpClient.SetCookies(u, cookieList)
 
-	log.Printf("账号 '%s' 已装载新获取的 Cookie，正在重新初始化...", c.displayAccountID())
+	log.Printf("账号 '%s' 已装载新获取的 Cookie，正在进行重新初始化验证...", displayID)
 	return c.Init()
 }
 
-func (c *Client) StreamGenerateContent(prompt string, model string, files []FileData, meta *ChatMetadata) (io.ReadCloser, error) {
-	resp, err := c.doGenerateContentRequest(prompt, model, files, meta)
+func (c *Client) StreamGenerateContent(ctx context.Context, prompt string, model string, files []FileData, meta *ChatMetadata) (io.ReadCloser, error) {
+	resp, err := c.doGenerateContentRequest(ctx, prompt, model, files, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -204,7 +214,7 @@ func (c *Client) StreamGenerateContent(prompt string, model string, files []File
 
 		// 刷新成功后重试一次
 		log.Printf("账号 '%s' Cookie 刷新成功，正在重试请求...", c.displayAccountID())
-		resp, err = c.doGenerateContentRequest(prompt, model, files, meta)
+		resp, err = c.doGenerateContentRequest(ctx, prompt, model, files, meta)
 		if err != nil {
 			return nil, err
 		}
@@ -220,7 +230,7 @@ func (c *Client) StreamGenerateContent(prompt string, model string, files []File
 	return resp.Body, nil
 }
 
-func (c *Client) doGenerateContentRequest(prompt string, model string, files []FileData, meta *ChatMetadata) (*http.Response, error) {
+func (c *Client) doGenerateContentRequest(ctx context.Context, prompt string, model string, files []FileData, meta *ChatMetadata) (*http.Response, error) {
 	payload := BuildGeneratePayload(prompt, c.ReqID, files, meta)
 	c.ReqID++
 
@@ -230,6 +240,7 @@ func (c *Client) doGenerateContentRequest(prompt string, model string, files []F
 	data := form.Encode()
 
 	req, _ := http.NewRequest(http.MethodPost, EndpointGenerate, strings.NewReader(data))
+	req = req.WithContext(ctx)
 
 	q := req.URL.Query()
 	q.Add("bl", c.VersionBL)
@@ -313,11 +324,11 @@ func (c *Client) FetchImage(imageURL string) ([]byte, error) {
 	return nil, fmt.Errorf("too many redirects")
 }
 
-func (c *Client) FetchImage1(imageURL string) ([]byte, error) {
-	return c.doFetchImageWithRetry(imageURL, true)
+func (c *Client) FetchImage1(ctx context.Context, imageURL string) ([]byte, error) {
+	return c.doFetchImageWithRetry(ctx, imageURL, true)
 }
 
-func (c *Client) doFetchImageWithRetry(imageURL string, retry bool) ([]byte, error) {
+func (c *Client) doFetchImageWithRetry(ctx context.Context, imageURL string, retry bool) ([]byte, error) {
 	maxRedirects := 5
 	currentURL := imageURL
 
@@ -331,15 +342,20 @@ func (c *Client) doFetchImageWithRetry(imageURL string, retry bool) ([]byte, err
 	// 3. 计算总延迟时间 (1秒 ~ 2秒)
 	totalDelay := baseDelay + extraDelay
 
-	// 执行延迟
+	// 执行延迟 (支持 Context 取消)
 	fmt.Printf("开始睡眠，随机延迟时间为: %v\n", totalDelay)
-	time.Sleep(totalDelay)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(totalDelay):
+	}
 
 	for i := 0; i < maxRedirects; i++ {
 		req, err := http.NewRequest(http.MethodGet, currentURL, nil)
 		if err != nil {
 			return nil, fmt.Errorf("创建请求失败: %w", err)
 		}
+		req = req.WithContext(ctx)
 
 		// 1. 每次重定向都重新注入 Cookie (保留你的原逻辑)
 		for k, v := range c.Cookies {
@@ -386,7 +402,7 @@ func (c *Client) doFetchImageWithRetry(imageURL string, retry bool) ([]byte, err
 			if retry && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized) {
 				log.Printf("账号 '%s' 下载图片返回 %d，尝试刷新 Cookie 并重试...", c.displayAccountID(), resp.StatusCode)
 				if refreshErr := c.RefreshCookies(); refreshErr == nil {
-					return c.doFetchImageWithRetry(imageURL, false)
+					return c.doFetchImageWithRetry(ctx, imageURL, false)
 				}
 			}
 			return nil, fmt.Errorf("图片获取失败，最终状态码: %d", resp.StatusCode)

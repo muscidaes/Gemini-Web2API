@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -64,11 +65,11 @@ func ClaudeMessagesHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 			log.Printf("[Claude] Model mapped: %s -> %s", req.Model, mappedModel)
 		}
 
-		prompt, files := buildClaudePrompt(&req, client)
+		prompt, files := buildClaudePrompt(c.Request.Context(), &req, client)
 
 		gemini.RandomDelay()
 
-		respBody, err := client.StreamGenerateContent(prompt, mappedModel, files, nil)
+		respBody, err := client.StreamGenerateContent(c.Request.Context(), prompt, mappedModel, files, nil)
 		if err != nil {
 			log.Printf("[Claude] Gemini request failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -208,7 +209,7 @@ func ClaudeCountTokensHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 	}
 }
 
-func buildClaudePrompt(req *claude.ClaudeRequest, client *gemini.Client) (string, []gemini.FileData) {
+func buildClaudePrompt(ctx context.Context, req *claude.ClaudeRequest, client *gemini.Client) (string, []gemini.FileData) {
 	var builder strings.Builder
 	var files []gemini.FileData
 
@@ -260,7 +261,7 @@ func buildClaudePrompt(req *claude.ClaudeRequest, client *gemini.Client) (string
 						data, err := base64.StdEncoding.DecodeString(block.Source.Data)
 						if err == nil {
 							fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
-							fid, err := client.UploadFile(data, fname)
+							fid, err := client.UploadFile(ctx, data, fname)
 							if err == nil {
 								files = append(files, gemini.FileData{
 									URL:      fid,

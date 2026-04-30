@@ -13,6 +13,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -202,7 +203,7 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 										data, err := base64.StdEncoding.DecodeString(parts[1])
 										if err == nil {
 											fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
-											fid, err := client.UploadFile(data, fname)
+											fid, err := client.UploadFile(c.Request.Context(), data, fname)
 											if err == nil {
 												files = append(files, gemini.FileData{
 													URL:      fid,
@@ -232,7 +233,7 @@ func ChatCompletionHandler(pool *balancer.AccountPool) gin.HandlerFunc {
 
 		gemini.RandomDelay()
 
-		respBody, err := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
+		respBody, err := client.StreamGenerateContent(c.Request.Context(), finalPrompt, req.Model, files, nil)
 		if err != nil {
 			log.Printf("Gemini request failed: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to communicate with Gemini: " + err.Error()})
@@ -629,7 +630,7 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 												fname := fmt.Sprintf("image_%d.png", time.Now().UnixNano())
 
 												// ⚠️ 注意：这里可能会因为网络代理问题卡住
-												fid, err := client.UploadFile(data, fname)
+												fid, err := client.UploadFile(c.Request.Context(), data, fname)
 
 												if err == nil {
 													log.Printf("[Images-Debug] ☁️ 图片上传 Google 成功！FID: %s", fid)
@@ -672,7 +673,7 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 	}
 
 	log.Printf("[Images-Debug] ⏳ 开始调用底层 StreamGenerateContent 接口...")
-	respBody, err := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
+	respBody, err := client.StreamGenerateContent(c.Request.Context(), finalPrompt, req.Model, files, nil)
 	if err != nil {
 		log.Printf("[Images-Debug] 💥 底层接口调用崩溃报错: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -683,23 +684,19 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 	log.Printf("[Images-Debug] 📥 底层接口调用成功，正在提取返回的图片 URL...")
 	imageURLs := extractImageURLsFromResponse(respBody)
 
-	// 如果提取不到图片，尝试刷新 Cookie 并重试一次
+	// 如果提取不到图片，尝试重试（不在这里刷新 Cookie，由 client 内部控制）
 	if len(imageURLs) == 0 {
-		log.Printf("[Images-Debug] ⚠️ 未能从 Google 响应中提取到任何图片，尝试刷新 Cookie 并重试...")
+		log.Printf("[Images-Debug] ⚠️ 未能从 Google 响应中提取到任何图片，正在重试请求...")
 		respBody.Close() // 关闭旧的响应流
 
-		if refreshErr := client.RefreshCookies(); refreshErr == nil {
-			log.Printf("[Images-Debug] 🔄 Cookie 刷新成功，正在重试请求...")
-			retryRespBody, retryErr := client.StreamGenerateContent(finalPrompt, req.Model, files, nil)
-			if retryErr == nil {
-				respBody = retryRespBody
-				imageURLs = extractImageURLsFromResponse(respBody)
-				log.Printf("[Images-Debug] 🔄 重试后提取到的图片数量: %d", len(imageURLs))
-			} else {
-				log.Printf("[Images-Debug] ❌ 重试请求失败: %v", retryErr)
-			}
+		// 直接调用底层接口，client.StreamGenerateContent 内部如果遇到 401/403 会自动刷新 Cookie
+		retryRespBody, retryErr := client.StreamGenerateContent(c.Request.Context(), finalPrompt, req.Model, files, nil)
+		if retryErr == nil {
+			respBody = retryRespBody
+			imageURLs = extractImageURLsFromResponse(respBody)
+			log.Printf("[Images-Debug] 🔄 重试后提取到的图片数量: %d", len(imageURLs))
 		} else {
-			log.Printf("[Images-Debug] ❌ 刷新 Cookie 失败: %v", refreshErr)
+			log.Printf("[Images-Debug] ❌ 重试请求失败: %v", retryErr)
 		}
 	}
 
@@ -714,22 +711,42 @@ func handleImageChatRequest(c *gin.Context, client *gemini.Client, req ChatReque
 		return
 	}
 
-	// ========== 【优化版】带 Referer + UA 的图片下载 ==========
-	var content strings.Builder
-	for i, imgURL := range imageURLs {
-		fullURL := imgURL
-		if !strings.Contains(fullURL, "=s") {
-			fullURL = imgURL + "=s2048" // 保持你原来的缩放逻辑
-		}
+	// ========== 【优化版】并发下载图片 ==========
+	var wg sync.WaitGroup
+	imgResults := make([]struct {
+		data []byte
+		err  error
+	}, len(imageURLs))
 
-		data, err := client.FetchImage1(fullURL)
-		if err != nil {
-			log.Printf("[Images] Failed to fetch image: %v (URL: %s)", err, fullURL)
+	for i, imgURL := range imageURLs {
+		wg.Add(1)
+		go func(index int, urlStr string) {
+			defer wg.Done()
+
+			fullURL := urlStr
+			if !strings.Contains(fullURL, "=s") {
+				fullURL = urlStr + "=s2048" // 保持你原来的缩放逻辑
+			}
+
+			// 💡 改进：传入 Request Context，客户端断开时自动取消
+			data, err := client.FetchImage1(c.Request.Context(), fullURL)
+			imgResults[index].data = data
+			imgResults[index].err = err
+		}(i, imgURL)
+	}
+
+	wg.Wait()
+
+	var content strings.Builder
+	for i, res := range imgResults {
+		if res.err != nil {
+			log.Printf("[Images] Failed to fetch image %d: %v", i+1, res.err)
 			continue
 		}
-
-		b64 := base64.StdEncoding.EncodeToString(data)
-		content.WriteString(fmt.Sprintf("![Generated Image %d](data:image/png;base64,%s)\n\n", i+1, b64))
+		if len(res.data) > 0 {
+			b64 := base64.StdEncoding.EncodeToString(res.data)
+			content.WriteString(fmt.Sprintf("![Generated Image %d](data:image/png;base64,%s)\n\n", i+1, b64))
+		}
 	}
 
 	if content.Len() == 0 {
